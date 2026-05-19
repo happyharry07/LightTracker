@@ -1,6 +1,12 @@
 # LightTracker
-Design a car that can follow the light spot of a laser by calculating their relative coordinate and estimate the laser direction.
 
+Design a car that can follow the light spot of a laser by calculating their relative coordinates and estimating the laser direction.
+
+---
+
+## 📂 Project Structure
+
+```text
 Project_LightTracker/
 ├── 01_Unit_Tests/                   # First Stage: Hardware Validation Units
 │   ├── test_mpu6050/                # IMU sensor zero-bias calibration test
