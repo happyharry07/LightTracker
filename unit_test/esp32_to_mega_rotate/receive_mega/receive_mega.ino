@@ -3,12 +3,12 @@
 #include <Adafruit_Sensor.h>
 #include <math.h>
 
-int PWMA = 10;
-int AIN2 = 6;
-int AIN1 = 7;
-int BIN1 = 8;
-int BIN2 = 9;
-int PWMB = 11;
+int PWMA = 15;
+int AIN2 = 2;
+int AIN1 = 0;
+int BIN1 = 4;
+int BIN2 = 16;
+int PWMB = 17;
 
 /* ========= 小車本地 MPU6050 變數 ========= */
 Adafruit_MPU6050 localMpu;
