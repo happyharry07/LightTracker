@@ -10,8 +10,8 @@ float currentDistance = -1.0;          // 全域變數：儲存當前最新距�
 // ==================== 距離控制參數 ====================
 const float TARGET_DISTANCE = 1.50;    // 目標保持距離：1.5 公尺
 const float KP = 200.0;                 // 比例增益 (P Gain)，可根據車速與重量上下調整
-const int MAX_MOTOR_SPEED = 150;        // 限制馬達最大 PWM 輸出 (0-255)，避免暴衝
-const int MIN_MOTOR_SPEED = 50;         // 克服馬達靜摩擦力的最小啟動 PWM
+const int MAX_MOTOR_SPEED = 200;        // 限制馬達最大 PWM 輸出 (0-255)，避免暴衝
+const int MIN_MOTOR_SPEED = 60;         // 克服馬達靜摩擦力的最小啟動 PWM
 const float DEAD_ZONE = 0.10;          // 死區範圍 (3cm)，在此誤差內車子靜止，防止微幅抖動
 
 // ==================== 馬達引腳配置 ====================
