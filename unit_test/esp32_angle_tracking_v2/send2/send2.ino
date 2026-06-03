@@ -33,7 +33,7 @@ static inline float wrap360(float a) {
 void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {}
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(9600);
   WiFi.mode(WIFI_STA);
   if (esp_now_init() != ESP_OK) return;
   esp_now_register_send_cb((esp_now_send_cb_t)OnDataSent);
