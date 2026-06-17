@@ -52,6 +52,7 @@ esp_now_peer_info_t peerInfo;
 
 volatile float remote_pitch = 0.0f;   
 volatile bool first_data_received = false;
+volatile unsigned long packet_count = 0; // 計算開機後收到的合法封包數，過濾開機混亂期
 
 // 追蹤 Pitch 穩定度的變數
 float last_remote_pitch = 0.0f;
@@ -69,6 +70,7 @@ float current_yaw = 0.0f;      // 小車實時運算、累積的當前絕對角�
 unsigned long prevMicros = 0;
 
 bool mpu_ready = false;
+bool system_fully_ready = false; // 整體系統安全就緒旗標
 unsigned long lastMpuReadTime = 0;
 const unsigned long MPU_READ_INTERVAL = 15; // 採樣時間，讓動態角度更新更靈敏 
 
@@ -86,6 +88,7 @@ void setup() {
   Serial.begin(115200);
   UwbSerial.begin(115200, SERIAL_8N1, BU03_RX, BU03_TX);
   
+  // 嚴格阻斷：初始化第一時間強制關閉馬達，防止浮空電壓干擾
   pinMode(PWMA, OUTPUT); pinMode(PWMB, OUTPUT);
   pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT);
   pinMode(BIN1, OUTPUT); pinMode(BIN2, OUTPUT);
@@ -99,7 +102,9 @@ void setup() {
     
     // 陀螺儀精準靜止校正（開機時請將車體擺正、靜止放置）
     Serial.println("====== MPU6050 Calibrating... PLEASE KEEP CAR STILL ======");
-    delay(500);
+    MotorWriting(0, 0); // 再次確保校正期間馬達絕對不出力
+    delay(600);
+    
     float sum_gz = 0.0f;
     for (int i = 0; i < 250; i++) {
       sensors_event_t a, g, temp;
@@ -108,7 +113,6 @@ void setup() {
     }
     gz_offset = sum_gz / 250.0f;
     
-    // 【核心修正】：開機校正後的起點，強制設定為小車宇宙的絕對「0.0度」
     current_yaw = 0.0f; 
     mpu_ready = true;
     Serial.println("====== Calibration Success! Initial Car Yaw locked at 0.0 ======");
@@ -123,8 +127,10 @@ void setup() {
   peerInfo.channel = 0; peerInfo.encrypt = false;
   esp_now_add_peer(&peerInfo);
 
-  delay(500);
+  delay(200);
   checkUwbModule();
+
+  MotorWriting(0, 0); // 確保開機完畢時馬達處於煞停狀態
 
   prevMicros = micros();
   lastMpuReadTime = millis();
@@ -144,7 +150,7 @@ void loop() {
     }
   }
   
-  /* ==================== 1. 定時更新小車絕對角度（留著校正、自由運算） ==================== */
+  /* ==================== 1. 定時更新小車絕對角度 ==================== */
   if (mpu_ready && (currentMillis - lastMpuReadTime >= MPU_READ_INTERVAL)) {
     lastMpuReadTime = currentMillis;
     sensors_event_t a, g, temp;
@@ -155,19 +161,28 @@ void loop() {
       if (dt <= 0.0f || dt > 0.04f) dt = 0.015f; 
 
       float gz_deg = (g.gyro.z * 180.0f / PI) - gz_offset;
-      if (abs(gz_deg) > 0.55f) { // 門檻值過濾馬達微小機體震動
+      
+      // 【核心修正】：將防震死區門檻從 0.55f 降到 0.15f
+      if (abs(gz_deg) > 0.15f) { 
         current_yaw += gz_deg * dt;
       }
-      current_yaw = wrap360(current_yaw); // 保持在 0~360 之間自由變動
+      current_yaw = wrap360(current_yaw); 
     }
   }
 
-  /* ==================== 2. 指向追隨運動控制演算法 ==================== */
+  /* ==================== 2. 安全解鎖檢查機制 ==================== */
+  if (!system_fully_ready) {
+    if (mpu_ready && first_data_received && packet_count > 5) {
+      system_fully_ready = true;
+      Serial.println("====== SAFETY LOCK UNLOCKED: MOTOR SYSTEM ACTIVE ======");
+    }
+  }
+
+  /* ==================== 3. 指向追隨運動控制演算法 ==================== */
   double speedL = 0;
   double speedR = 0;
 
-  // 只要收到通訊且陀螺儀就緒，立刻進行實時 PD 閉迴路控制
-  if (first_data_received && mpu_ready) {
+  if (system_fully_ready) {
     
     float pitchRadian = abs(remote_pitch) * PI / 180.0f; 
     if (pitchRadian < 0.05f) pitchRadian = 0.05f; 
@@ -175,34 +190,35 @@ void loop() {
     // ---- A. 幾何計算：計算目標【斜邊距離】 ----
     dynamicTargetSlantDistance = REMOTE_HEIGHT / sin(pitchRadian);
     
-    // 限制範圍限制
     if (dynamicTargetSlantDistance > 4.5f) dynamicTargetSlantDistance = 4.5f;
     if (dynamicTargetSlantDistance < 1.0f) dynamicTargetSlantDistance = 1.0f;
 
-    // ---- B. 直線偏擺修正（防爆限幅版：永遠拿絕對 0 度來減 current_yaw） ----
-    float error_yaw = 0.0f - current_yaw; // 目標固定為 0
-    if (error_yaw > 180.0f)  error_yaw -= 360.0f;
-    if (error_yaw < -180.0f) error_yaw += 360.0f;
+    // ---- B. 直線偏擺修正 ----
+    float error_yaw = 0.0f - current_yaw; 
     
-    // 【防爆修正 1】限制角度誤差的最大補正衝擊力（最大只允許補正 45 度）
-    // 防止誤差接近 180 度時，turnOutput 爆表導致馬達正負號瘋狂抖動而觸發重設
+    while (error_yaw > 180.0f)  error_yaw -= 360.0f;
+    while (error_yaw < -180.0f) error_yaw += 360.0f;
+    
     if (error_yaw > 45.0f)  error_yaw = 45.0f;
     if (error_yaw < -45.0f) error_yaw = -45.0f;
 
     float error_diff_yaw = error_yaw - last_error_yaw;
+    
+    // 【修正 1】：收攏微分誤差，消除 180 度瞬間跳變產生的 360 度突波
+    while (error_diff_yaw > 180.0f)  error_diff_yaw -= 360.0f;
+    while (error_diff_yaw < -180.0f) error_diff_yaw += 360.0f;
+    
     last_error_yaw = error_yaw;
     
-    float turnOutput = error_yaw * Kp_turn + error_diff_yaw * Kd_turn;
-
-    // 【防爆修正 2】限制 turnOutput 的絕對最大出力，不讓轉向完全吃掉馬達頻寬
-    const float MAX_TURN_OUTPUT = 80.0f; 
-    if (turnOutput > MAX_TURN_OUTPUT)  turnOutput = MAX_TURN_OUTPUT;
-    if (turnOutput < -MAX_TURN_OUTPUT) turnOutput = -MAX_TURN_OUTPUT;
+    // ---- 加入「角度死區」聯鎖 ----
+    float turnOutput = 0;
+    if (abs(error_yaw) > 5.0f) {
+      turnOutput = error_yaw * Kp_turn + error_diff_yaw * Kd_turn;
+    }
 
     // ---- C. 距離前後追隨推力 ----
     float distOutput = 0;
     
-    // 檢查發送端角度是否已經保持不動超過 0.5 秒 (500ms)
     if (currentMillis - stableStartTime >= WAIT_STABLE_MS) {
       is_command_valid = true;
     } else {
@@ -210,62 +226,91 @@ void loop() {
     }
 
     if (!is_command_valid) {
-      distOutput = 0; // 指令未合法確認前，只修正角度直行，不給予前後前進推力
+      distOutput = 0; 
     } else {
       if (currentDistance >= 0) {
-        // 直接比對 UWB 的實測斜邊距離與目標斜邊距離
         float error_dist = currentDistance - dynamicTargetSlantDistance;
-        
         if (abs(error_dist) > DEAD_ZONE_DIST) {
-          distOutput = error_dist * KP_dist; // 衝過頭誤差為負時，馬達會直接反轉後退，絕不迴轉
+          distOutput = error_dist * KP_dist; 
         }
       }
     }
 
-    // ---- D. 混控核心（結合直行推力與偏擺修正，隨時收拾 current_yaw 偏離 0 度的殘局） ----
-    speedL = distOutput + turnOutput;
-    speedR = distOutput - turnOutput;
+    // ---- D. 混控核心 ----
+    // 【修正 2】：對調轉向輸出極性，解決正回饋暴衝遠離 0 度的問題
+    speedL = distOutput - turnOutput;
+    speedR = distOutput + turnOutput;
 
-    // ---- E. 限制最大/最小速度，克服馬達靜摩擦力 ----
-    if (abs(speedL) > 0.1) {
-      if (speedL > MAX_MOTOR_SPEED)  speedL = MAX_MOTOR_SPEED;
-      if (speedL < -MAX_MOTOR_SPEED) speedL = -MAX_MOTOR_SPEED;
-      if (speedL > 0 && speedL < MIN_MOTOR_SPEED)  speedL = MIN_MOTOR_SPEED;
-      if (speedL < 0 && speedL > -MIN_MOTOR_SPEED) speedL = -MIN_MOTOR_SPEED;
+    // ---- E. 到站絕對強行煞停死區 ----
+    if (abs(error_yaw) < 3.0f && (!is_command_valid || (currentDistance >= 0 && abs(currentDistance - dynamicTargetSlantDistance) <= DEAD_ZONE_DIST))) {
+      speedL = 0;
+      speedR = 0;
+      last_error_yaw = 0; // 清空偏擺微分，防止殘留震盪
+    } else {
+      // 限制最大/最小速度，克服馬達靜摩擦力
+      if (abs(speedL) > 0.1) {
+        if (speedL > MAX_MOTOR_SPEED)  speedL = MAX_MOTOR_SPEED;
+        if (speedL < -MAX_MOTOR_SPEED) speedL = -MAX_MOTOR_SPEED;
+        if (speedL > 0 && speedL < MIN_MOTOR_SPEED)  speedL = MIN_MOTOR_SPEED;
+        if (speedL < 0 && speedL > -MIN_MOTOR_SPEED) speedL = -MIN_MOTOR_SPEED;
+      }
+      if (abs(speedR) > 0.1) {
+        if (speedR > MAX_MOTOR_SPEED)  speedR = MAX_MOTOR_SPEED;
+        if (speedR < -MAX_MOTOR_SPEED) speedR = -MAX_MOTOR_SPEED;
+        if (speedR > 0 && speedR < MIN_MOTOR_SPEED)  speedR = MIN_MOTOR_SPEED;
+        if (speedR < 0 && speedR > -MIN_MOTOR_SPEED) speedR = -MIN_MOTOR_SPEED;
+      }
     }
-    if (abs(speedR) > 0.1) {
-      if (speedR > MAX_MOTOR_SPEED)  speedR = MAX_MOTOR_SPEED;
-      if (speedR < -MAX_MOTOR_SPEED) speedR = -MAX_MOTOR_SPEED;
-      if (speedR > 0 && speedR < MIN_MOTOR_SPEED)  speedR = MIN_MOTOR_SPEED;
-      if (speedR < 0 && speedR > -MIN_MOTOR_SPEED) speedR = -MIN_MOTOR_SPEED;
-    }
+  } else {
+    // 系統未就緒前，強制速度為零
+    speedL = 0; speedR = 0;
   }
 
-  // 寫入馬達
-  MotorWriting(speedL, speedR);
+  // --- 【修正 3】：加速度限制器核心 (Slew Rate Limiter) ---
+  // 防止馬達瞬間吃載過大導致 ESP32 褐出重啟 (Brownout)
+  static double actual_speedL = 0;
+  static double actual_speedR = 0;
+  const double MAX_ACCEL = 15.0; // 每個迴圈允許的最大加速度（可依據實測反應靈敏度微調）
 
-  /* ==================== 3. 定時主動回傳狀態給遙控器 ==================== */
-  if (first_data_received && (currentMillis - lastTxTime >= TX_INTERVAL)) {
+  if (speedL > actual_speedL + MAX_ACCEL) actual_speedL += MAX_ACCEL;
+  else if (speedL < actual_speedL - MAX_ACCEL) actual_speedL -= MAX_ACCEL;
+  else actual_speedL = speedL;
+
+  if (speedR > actual_speedR + MAX_ACCEL) actual_speedR += MAX_ACCEL;
+  else if (speedR < actual_speedR - MAX_ACCEL) actual_speedR -= MAX_ACCEL;
+  else actual_speedR = speedR;
+
+  // 寫入馬達硬體
+  MotorWriting(actual_speedL, actual_speedR);
+
+  /* ==================== 4. 定時主動回傳狀態給遙控器 ==================== */
+  if (system_fully_ready && (currentMillis - lastTxTime >= TX_INTERVAL)) {
     lastTxTime = currentMillis;
-    txData.car_yaw = current_yaw; // 把小車實時更新的真實角度回傳給遙控器監控
+    txData.car_yaw = current_yaw; 
     txData.distance = currentDistance; 
     esp_now_send(remoteAddress, (uint8_t *) &txData, sizeof(txData));
   }
 
-  /* ==================== 4. 定時序列埠監控 ==================== */
+  /* ==================== 5. 定時序列埠監控 ==================== */
   static unsigned long lastPrint = 0;
   if (currentMillis - lastPrint > 250) {
     lastPrint = currentMillis;
-    Serial.print("TgtYaw: 0.0");
-    Serial.print(" | CarYaw: ");    Serial.print(current_yaw, 1);
-    Serial.print(" | Pitch: ");   Serial.print(remote_pitch, 1);
-    Serial.print(" | CmdStatus: "); Serial.print(is_command_valid ? "VALID" : "HOLD ");
-    Serial.print(" | UWB Slant/Tgt: "); Serial.print(currentDistance, 2); Serial.print("/"); Serial.print(dynamicTargetSlantDistance, 2);
-    Serial.print(" | Motor: "); Serial.print((int)speedL); Serial.print("/"); Serial.println((int)speedR);
+    if (!system_fully_ready) {
+      Serial.print("[SYSTEM LOCKING] Waiting for stable orientation... Packet Count: ");
+      Serial.println(packet_count);
+    } else {
+      Serial.print("TgtYaw: 0.0");
+      Serial.print(" | CarYaw: ");    Serial.print(current_yaw, 1);
+      Serial.print(" | Pitch: ");   Serial.print(remote_pitch, 1);
+      Serial.print(" | CmdStatus: "); Serial.print(is_command_valid ? "VALID" : "HOLD ");
+      Serial.print(" | UWB Slant/Tgt: "); Serial.print(currentDistance, 2); Serial.print("/"); Serial.print(dynamicTargetSlantDistance, 2);
+      Serial.print(" | Motor(Cmd/Act): "); Serial.print((int)speedL); Serial.print("/"); Serial.print((int)speedR);
+      Serial.print(" -> "); Serial.print((int)actual_speedL); Serial.print("/"); Serial.println((int)actual_speedR);
+    }
   }
 }
 
-// ==================== 馬達驅動核心 ====================
+// ==================== 馬達驅動底層 ====================
 void MotorWriting(double vL, double vR) {
   if (vR >= 0) {
     digitalWrite(BIN1, LOW);  digitalWrite(BIN2, HIGH);
@@ -288,14 +333,16 @@ void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDat
   if (len >= sizeof(struct_message)) {
     memcpy(&incomingData, incomingDataRaw, sizeof(struct_message));
     
+    packet_count++; // 累加合法封包數
+    
     float new_pitch = incomingData.pitch;
     float pitch_delta = abs(new_pitch - last_remote_pitch);
     last_remote_pitch = new_pitch;
     remote_pitch = new_pitch;
 
-    // 狀態機：如果手在晃動，就不斷刷新計時器；手停住不動時，計時器才會開始累積時間
+    // 如果手部姿態晃動大於門檻值，重設 0.5 秒起算計時器
     if (pitch_delta > PITCH_STABLE_THRESHOLD) {
-      stableStartTime = millis(); // 晃動中，重設 0.5 秒的起算點
+      stableStartTime = millis(); 
     }
     
     first_data_received = true; 
