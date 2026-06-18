@@ -26,13 +26,13 @@ unsigned long prevMicros = 0;
 float yaw_offset = 0.0f;    
 bool origin_set = false;    
 
-const double Kp_turn = 4.5;   
-const double Kd_turn = 0.25;  
+const double Kp_turn = 2;   
+const double Kd_turn = 1;  
 float last_error = 0.0f;     
 bool is_moving = false;
 
 const int MAX_SPEED = 130;  
-const int MIN_SPEED = 65;     
+const int MIN_SPEED = 85;     
 bool mpu_ready = false;
 
 unsigned long lastMpuReadTime = 0;
