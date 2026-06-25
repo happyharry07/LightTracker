@@ -7,14 +7,13 @@
 #include <HardwareSerial.h>
 
 // ==================== 【系統參數配置】 ====================
-// 發送端（遙控器）的 MAC 地址
 uint8_t remoteAddress[] = {0x68, 0xFE, 0x71, 0x0C, 0x33, 0x3C};
 
-const float REMOTE_HEIGHT = 0.80;         // 已同步遙控器高度 0.8m
-const float MAX_TARGET_DIST = 4.5f;       // 距離上限
-const float PITCH_STABLE_THRESHOLD = 2.0; 
-const float YAW_STABLE_THRESHOLD = 3.0;   
-const unsigned long WAIT_STABLE_MS = 600; 
+const float REMOTE_HEIGHT = 0.80;         
+const float MAX_TARGET_DIST = 4.5f;       
+const float PITCH_STABLE_THRESHOLD = 1.5; 
+const float YAW_STABLE_THRESHOLD = 2.0;   
+const unsigned long WAIT_STABLE_MS = 800; 
 
 // ==================== 【全局座標系與推算變數】 ====================
 float X_car = 0.0f;
@@ -22,8 +21,8 @@ float Y_car = 0.0f;
 float X_tgt = 0.0f;
 float Y_tgt = 0.0f;
 
-float filtered_uwb_dist = -1.0f;
-float last_valid_uwb_dist = -1.0f;
+// 儲存當前最新的地面水平距離
+float current_ground_dist = -1.0f;
 
 enum CarState {
   STATE_HOLD,    
@@ -35,12 +34,13 @@ CarState currentState = STATE_HOLD;
 // ==================== 【PID 控制器參數】 ====================
 const float KP_dist = 180.0;             
 const float DEAD_ZONE_DIST = 0.10;       
-const float TURN_ALIGN_TOLERANCE = 5.0;  
+const float TURN_ALIGN_TOLERANCE = 4.0;  
 const double Kp_turn = 5.0;   
 const double Kd_turn = 0.8;
 float last_error_yaw = 0.0f;     
 const int MAX_MOTOR_SPEED = 150;  
 const int MIN_MOTOR_SPEED = 70;   
+const int MAX_TURN_SPEED = 90; 
 
 // ==================== 【硬體與通訊配置】 ====================
 HardwareSerial UwbSerial(2);
@@ -140,11 +140,16 @@ void setup() {
   }
   
   if(valid_reads > 0) {
-    filtered_uwb_dist = sum_dist / valid_reads;
-    last_valid_uwb_dist = filtered_uwb_dist;
-    X_car = filtered_uwb_dist; 
+    float raw_uwb_init = sum_dist / valid_reads;
+    float init_ground_dist = 0.0f;
+    if (raw_uwb_init > REMOTE_HEIGHT) {
+      init_ground_dist = sqrt(raw_uwb_init * raw_uwb_init - REMOTE_HEIGHT * REMOTE_HEIGHT);
+    }
+    
+    current_ground_dist = init_ground_dist;
+    X_car = current_ground_dist; 
     Y_car = 0.0f;
-    Serial.printf("Init Success! Locked Car Coordinate: X: %.2f, Y: 0.00\n", X_car);
+    Serial.printf("Init Success! Locked Ground Coord: X: %.2f, Y: 0.00\n", X_car);
   }
 
   prevMicros = micros();
@@ -154,6 +159,7 @@ void loop() {
   unsigned long currentMillis = millis();
   
   /* ==================== 1. 更新感測器與座標推算 ==================== */
+  // A. 陀螺儀角度更新 (每 15ms)
   static unsigned long lastMpuTime = 0;
   if (mpu_ready && (currentMillis - lastMpuTime >= 15)) {
     lastMpuTime = currentMillis;
@@ -170,38 +176,51 @@ void loop() {
     }
   }
 
+  // B. UWB 測距與座標絕對投影校正 (每 50ms)
   static unsigned long lastUwbTime = 0;
   if (currentMillis - lastUwbTime >= 50) {
     lastUwbTime = currentMillis;
-    float raw_dist = getDistanceFast();
+    float raw_uwb_dist = getDistanceFast();
     
-    if (raw_dist > 0 && system_fully_ready) {
-      filtered_uwb_dist = (filtered_uwb_dist < 0) ? raw_dist : (0.7 * filtered_uwb_dist + 0.3 * raw_dist);
+    if (raw_uwb_dist > 0 && system_fully_ready) {
       
-      if (currentState == STATE_FORWARD) {
-        float delta_r = filtered_uwb_dist - last_valid_uwb_dist;
-        
-        float r_mag = sqrt(X_car*X_car + Y_car*Y_car);
-        if (r_mag > 0.1f) {
-          float rx = X_car / r_mag;
-          float ry = Y_car / r_mag;
-          
-          float yaw_rad = current_yaw * PI / 180.0f;
-          float hx = cos(yaw_rad);
-          float hy = sin(yaw_rad);
-          
-          float cos_alpha = rx * hx + ry * hy;
-          
-          if (abs(cos_alpha) > 0.15f) {
-            float d_moved = delta_r / cos_alpha;
-            if (abs(d_moved) < 0.1f) {
-              X_car += d_moved * hx;
-              Y_car += d_moved * hy;
-            }
-          }
-        }
+      // 畢氏定理轉換：取得當下真實的地面距離
+      if (raw_uwb_dist > REMOTE_HEIGHT) {
+        current_ground_dist = sqrt(raw_uwb_dist * raw_uwb_dist - REMOTE_HEIGHT * REMOTE_HEIGHT);
+      } else {
+        current_ground_dist = 0.0f;
       }
-      last_valid_uwb_dist = filtered_uwb_dist;
+      
+      // 【修改核心】：完全拔除先前的距離加權與投影。
+      // 只在直線前進時，利用純幾何交點公式 (Line-Circle Intersection) 算出確切座標
+      if (currentState == STATE_FORWARD) {
+        float yaw_rad = current_yaw * PI / 180.0f;
+        float hx = cos(yaw_rad);
+        float hy = sin(yaw_rad);
+        
+        // 代數推導：求未知變數 t (移動距離) 使得 (X + t*hx)^2 + (Y + t*hy)^2 = R^2
+        float B = 2.0f * (X_car * hx + Y_car * hy);
+        float C = (X_car * X_car + Y_car * Y_car) - (current_ground_dist * current_ground_dist);
+        float discriminant = B * B - 4.0f * C;
+        
+        float t = 0;
+        if (discriminant < 0) {
+          // 若因 UWB 雜訊導致數學上沒有交點，取最靠近圓的點
+          t = -B / 2.0f;
+        } else {
+          // 有交點時，取移動距離較短的合理物理現實解
+          float t1 = (-B + sqrt(discriminant)) / 2.0f;
+          float t2 = (-B - sqrt(discriminant)) / 2.0f;
+          t = (abs(t1) < abs(t2)) ? t1 : t2;
+        }
+        
+        // 物理極限防護：50ms 內車子不可能瞬間移動超過 15cm，藉此濾除 UWB 瞬間跳躍雜訊
+        if (t > 0.15f) t = 0.15f;
+        if (t < -0.15f) t = -0.15f;
+        
+        X_car += t * hx;
+        Y_car += t * hy;
+      }
     }
   }
 
@@ -237,7 +256,10 @@ void loop() {
       
       float error_yaw = wrap180(target_yaw_deg - current_yaw);
 
-      if (target_dist <= DEAD_ZONE_DIST) {
+      // 喚醒磁滯區間：徹底防堵到達目標點時的震盪抽搐
+      float wakeup_threshold = (currentState == STATE_HOLD) ? (DEAD_ZONE_DIST + 0.10f) : DEAD_ZONE_DIST;
+
+      if (target_dist <= wakeup_threshold) {
         currentState = STATE_HOLD;     
       } else if (abs(error_yaw) > TURN_ALIGN_TOLERANCE) {
         currentState = STATE_TURN;     
@@ -251,15 +273,24 @@ void loop() {
       else if (currentState == STATE_TURN) {
         float turnOutput = error_yaw * Kp_turn + (error_yaw - last_error_yaw) * Kd_turn;
         last_error_yaw = error_yaw;
-        speedL = -turnOutput; speedR = turnOutput;
+        
+        float turn_mag = abs(turnOutput);
+        turn_mag = constrain(turn_mag, MIN_MOTOR_SPEED + 8, MAX_TURN_SPEED);
+
+        if (turnOutput > 0) {
+          speedL = -turn_mag; 
+          speedR = turn_mag;
+        } else {
+          speedL = turn_mag; 
+          speedR = -turn_mag;
+        }
       } 
       else if (currentState == STATE_FORWARD) {
         float distOutput = (target_dist - DEAD_ZONE_DIST) * KP_dist;
-        float turnAssist = error_yaw * (Kp_turn * 0.5);
-        speedL = distOutput - turnAssist; speedR = distOutput + turnAssist;
-      }
-
-      if (abs(speedL) > 0.1 || abs(speedR) > 0.1) {
+        
+        speedL = distOutput; 
+        speedR = distOutput;
+        
         speedL = constrain(speedL, -MAX_MOTOR_SPEED, MAX_MOTOR_SPEED);
         speedR = constrain(speedR, -MAX_MOTOR_SPEED, MAX_MOTOR_SPEED);
         if (speedL > 0 && speedL < MIN_MOTOR_SPEED) speedL = MIN_MOTOR_SPEED;
@@ -289,7 +320,7 @@ void loop() {
   if (system_fully_ready && (currentMillis - lastTxTime >= 60)) {
     lastTxTime = currentMillis;
     txData.car_yaw = current_yaw;
-    txData.distance = filtered_uwb_dist; 
+    txData.distance = current_ground_dist; // 回傳算完的真實地面距離
     txData.car_x = X_car;
     txData.car_y = Y_car;
     txData.tgt_x = X_tgt; 
